@@ -1,0 +1,708 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for a restaurant clickstream data analytics solution'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "S3 Bucket Configuration"
+        Parameters:
+          - BucketName
+          - EnableVersioning
+          - SSEAlgorithm
+          - DataRetentionDays
+      - Label:
+          default: "Firehose Configuration"
+        Parameters:
+          - DeliveryStreamName
+          - BufferingIntervalInSeconds
+          - BufferingSizeInMBs
+          - CompressionFormat
+      - Label:
+          default: "Lambda Function Configuration"
+        Parameters:
+          - LambdaFunctionName
+          - LambdaRuntime
+          - LambdaTimeout
+          - LambdaMemorySize
+          - LambdaCodeS3Bucket
+          - LambdaCodeS3Key
+      - Label:
+          default: "API Gateway Configuration"
+        Parameters:
+          - APIName
+          - APIEndpointType
+          - APILogLevel
+      - Label:
+          default: "Glue and Athena Configuration"
+        Parameters:
+          - GlueDatabaseName
+          - GlueCrawlerName
+          - CrawlerSchedule
+          - AthenaWorkgroupName
+          - AthenaResultsPrefix
+
+Parameters:
+  # S3 Bucket Configuration
+  BucketName:
+    Type: String
+    Description: Name of the S3 bucket to store clickstream data
+    Default: clickstream-analytics-bucket
+  
+  EnableVersioning:
+    Type: String
+    Description: Enable versioning on the S3 bucket
+    Default: Disabled
+    AllowedValues:
+      - Enabled
+      - Disabled
+  
+  SSEAlgorithm:
+    Type: String
+    Description: Server-side encryption algorithm for the S3 bucket
+    Default: AES256
+    AllowedValues:
+      - AES256
+      - aws:kms
+  
+  DataRetentionDays:
+    Type: Number
+    Description: Number of days to retain data before transitioning to Glacier
+    Default: 90
+    MinValue: 1
+  
+  # Firehose Configuration
+  DeliveryStreamName:
+    Type: String
+    Description: Name of the Kinesis Data Firehose delivery stream
+    Default: clickstream-delivery-stream
+  
+  BufferingIntervalInSeconds:
+    Type: Number
+    Description: Interval in seconds for Firehose buffering
+    Default: 60
+    MinValue: 60
+    MaxValue: 900
+  
+  BufferingSizeInMBs:
+    Type: Number
+    Description: Size in MBs for Firehose buffering
+    Default: 1
+    MinValue: 1
+    MaxValue: 128
+  
+  CompressionFormat:
+    Type: String
+    Description: Compression format for Firehose delivery
+    Default: UNCOMPRESSED
+    AllowedValues:
+      - UNCOMPRESSED
+      - GZIP
+      - ZIP
+      - SNAPPY
+  
+  # Lambda Function Configuration
+  LambdaFunctionName:
+    Type: String
+    Description: Name of the Lambda function for data transformation
+    Default: transform-data
+  
+  LambdaRuntime:
+    Type: String
+    Description: Runtime for the Lambda function
+    Default: python3.8
+    AllowedValues:
+      - python3.8
+      - python3.9
+      - python3.10
+      - python3.11
+  
+  LambdaTimeout:
+    Type: Number
+    Description: Timeout for the Lambda function in seconds
+    Default: 10
+    MinValue: 3
+    MaxValue: 900
+  
+  LambdaMemorySize:
+    Type: Number
+    Description: Memory allocation for Lambda function in MB
+    Default: 128
+    MinValue: 128
+    MaxValue: 10240
+  
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket containing Lambda function code (leave empty to use inline code)
+    Default: ""
+  
+  LambdaCodeS3Key:
+    Type: String
+    Description: S3 key for Lambda function code (leave empty to use inline code)
+    Default: ""
+  
+  # API Gateway Configuration
+  APIName:
+    Type: String
+    Description: Name of the API Gateway REST API
+    Default: clickstream-ingest-poc
+  
+  APIEndpointType:
+    Type: String
+    Description: Type of API Gateway endpoint
+    Default: REGIONAL
+    AllowedValues:
+      - REGIONAL
+      - EDGE
+      - PRIVATE
+  
+  APILogLevel:
+    Type: String
+    Description: Log level for API Gateway
+    Default: INFO
+    AllowedValues:
+      - OFF
+      - ERROR
+      - INFO
+  
+  # Glue and Athena Configuration
+  GlueDatabaseName:
+    Type: String
+    Description: Name of the Glue database
+    Default: clickstream_database
+  
+  GlueCrawlerName:
+    Type: String
+    Description: Name of the Glue crawler
+    Default: clickstream-crawler
+  
+  CrawlerSchedule:
+    Type: String
+    Description: Schedule expression for the Glue crawler
+    Default: cron(0 */6 * * ? *)
+  
+  AthenaWorkgroupName:
+    Type: String
+    Description: Name of the Athena workgroup
+    Default: ClickstreamWorkgroup
+  
+  AthenaResultsPrefix:
+    Type: String
+    Description: S3 prefix for Athena query results
+    Default: athena-results/
+
+Conditions:
+  UseInlineCode: !Or [!Equals [!Ref LambdaCodeS3Bucket, ""], !Equals [!Ref LambdaCodeS3Key, ""]]
+
+Resources:
+  # IAM Policies and Roles
+  APIFirehosePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy to allow API Gateway to put records to Firehose
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: VisualEditor0
+            Effect: Allow
+            Action: firehose:PutRecord
+            Resource: !Sub arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${DeliveryStreamName}
+      Tags:
+        - Key: Project
+          Value: ClickstreamAnalytics
+        - Key: Environment
+          Value: Production
+
+  APIGatewayFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref APIFirehosePolicy
+      Tags:
+        - Key: Project
+          Value: ClickstreamAnalytics
+        - Key: Environment
+          Value: Production
+    DeletionPolicy: Retain
+
+  FirehoseS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseS3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - !Sub arn:aws:s3:::${BucketName}
+                  - !Sub arn:aws:s3:::${BucketName}/*
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource: !GetAtt TransformDataFunction.Arn
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/${DeliveryStreamName}:*
+      Tags:
+        - Key: Project
+          Value: ClickstreamAnalytics
+        - Key: Environment
+          Value: Production
+    DeletionPolicy: Retain
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Project
+          Value: ClickstreamAnalytics
+        - Key: Environment
+          Value: Production
+    DeletionPolicy: Retain
+
+  # S3 Bucket
+  ClickstreamBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: !Ref EnableVersioning
+      ServerSideEncryptionConfiguration:
+        ServerSideEncryptionRule:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !Ref SSEAlgorithm
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: GlacierTransition
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: !Ref DataRetentionDays
+                StorageClass: GLACIER
+            ExpirationInDays: 2190  # 6 years
+      Tags:
+        - Key: Project
+          Value: ClickstreamAnalytics
+        - Key: Environment
+          Value: Production
+    DeletionPolicy: Retain
+
+  ClickstreamBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ClickstreamBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: 
+              - !Sub arn:aws:s3:::${BucketName}
+              - !Sub arn:aws:s3:::${BucketName}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # Lambda Function
+  TransformDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: !Ref LambdaRuntime
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Code: !If 
+        - UseInlineCode
+        - ZipFile: |
+            import json
+            import boto3
+            import base64
+
+            output = []
+
+            def lambda_handler(event, context):
+                for record in event['records']:
+                    payload = base64.b64decode(record['data']).decode('utf-8')
+
+                    row_w_newline = payload + "\n"
+                    row_w_newline = base64.b64encode(row_w_newline.encode('utf-8'))
+
+                    output_record = {
+                        'recordId': record['recordId'],
+                        'result': 'Ok',
+                        'data': row_w_newline
+                    }
+                    output.append(output_record)
+
+                return {'records': output}
+        - S3Bucket: !Ref LambdaCodeS3Bucket
+          S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          ENV: Production
+      Tags:
+        - Key: Project
+          Value: ClickstreamAnalytics
+        - Key: Environment
+          Value: Production
+    DeletionPolicy: Retain
+
+  # CloudWatch Log Group for Lambda
+  TransformDataFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${LambdaFunctionName}
+      RetentionInDays: 30
+    DeletionPolicy: Delete
+
+  # Kinesis Data Firehose
+  ClickstreamDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - ClickstreamBucket
+      - TransformDataFunction
+    Properties:
+      DeliveryStreamName: !Ref DeliveryStreamName
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt ClickstreamBucket.Arn
+        RoleARN: !GetAtt FirehoseS3Role.Arn
+        BufferingHints:
+          IntervalInSeconds: !Ref BufferingIntervalInSeconds
+          SizeInMBs: !Ref BufferingSizeInMBs
+        CompressionFormat: !Ref CompressionFormat
+        Prefix: '!{timestamp:yyyy/MM/dd/HH}/'
+        ErrorOutputPrefix: 'error/!{firehose:error-output-type}/!{timestamp:yyyy/MM/dd/HH}/'
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt TransformDataFunction.Arn
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: '1'
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: '60'
+        S3BackupMode: Disabled
+      Tags:
+        - Key: Project
+          Value: ClickstreamAnalytics
+        - Key: Environment
+          Value: Production
+
+  # API Gateway
+  ClickstreamAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref APIName
+      Description: API for clickstream data ingestion
+      EndpointConfiguration:
+        Types:
+          - !Ref APIEndpointType
+      Tags:
+        - Key: Project
+          Value: ClickstreamAnalytics
+        - Key: Environment
+          Value: Production
+
+  PocResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ClickstreamAPI
+      ParentId: !GetAtt ClickstreamAPI.RootResourceId
+      PathPart: poc
+
+  PocMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ClickstreamAPI
+      ResourceId: !Ref PocResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:firehose:action/PutRecord
+        Credentials: !GetAtt APIGatewayFirehoseRole.Arn
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "DeliveryStreamName": "${DeliveryStreamName}",
+              "Record": {
+                "Data": "$util.base64Encode($util.escapeJavaScript($input.json('$')).replace('\', ''))"
+              }
+            }
+        IntegrationResponses:
+          - StatusCode: 200
+      MethodResponses:
+        - StatusCode: 200
+
+  # API Gateway Deployment & Stage
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PocMethod
+    Properties:
+      RestApiId: !Ref ClickstreamAPI
+      StageName: prod
+
+  # API Gateway Stage Settings
+  APIStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref APIDeployment
+      RestApiId: !Ref ClickstreamAPI
+      StageName: prod
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: !Ref APILogLevel
+          DataTraceEnabled: true
+          MetricsEnabled: true
+      Tags:
+        - Key: Project
+          Value: ClickstreamAnalytics
+        - Key: Environment
+          Value: Production
+
+  # API Usage Plan
+  APIUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn:
+      - APIDeployment
+      - APIStage
+    Properties:
+      UsagePlanName: !Sub ${APIName}-UsagePlan
+      Description: Usage plan for Clickstream API
+      ApiStages:
+        - ApiId: !Ref ClickstreamAPI
+          Stage: prod
+      Throttle:
+        BurstLimit: 200
+        RateLimit: 100
+      Quota:
+        Limit: 10000
+        Period: DAY
+      Tags:
+        - Key: Project
+          Value: ClickstreamAnalytics
+        - Key: Environment
+          Value: Production
+
+  # API Key
+  APIKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn:
+      - APIDeployment
+    Properties:
+      Name: !Sub ${APIName}-ApiKey
+      Description: API Key for Clickstream API
+      Enabled: true
+      Tags:
+        - Key: Project
+          Value: ClickstreamAnalytics
+        - Key: Environment
+          Value: Production
+
+  # API Key Usage Plan Key
+  APIUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref APIKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref APIUsagePlan
+
+  # Glue Crawler for creating Athena table
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3BucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${BucketName}
+                  - !Sub arn:aws:s3:::${BucketName}/*
+      Tags:
+        - Key: Project
+          Value: ClickstreamAnalytics
+        - Key: Environment
+          Value: Production
+    DeletionPolicy: Retain
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: Database for clickstream data
+    DeletionPolicy: Retain
+
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Ref GlueCrawlerName
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${BucketName}/
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Schedule:
+        ScheduleExpression: !Ref CrawlerSchedule
+      Configuration: '{"Version":1.0,"CrawlerOutput":{"Tables":{"AddOrUpdateBehavior":"MergeNewColumns"}}}'
+      TablePrefix: clickstream_
+      Tags:
+        Project: ClickstreamAnalytics
+        Environment: Production
+
+  # Athena Workgroup
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref AthenaWorkgroupName
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${BucketName}/${AthenaResultsPrefix}
+        EngineVersion:
+          SelectedEngineVersion: AUTO
+      Tags:
+        - Key: Project
+          Value: ClickstreamAnalytics
+        - Key: Environment
+          Value: Production
+    DeletionPolicy: Retain
+
+Outputs:
+  S3BucketName:
+    Description: Name of the S3 bucket for clickstream data
+    Value: !Ref ClickstreamBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-S3BucketName
+
+  S3BucketArn:
+    Description: ARN of the S3 bucket for clickstream data
+    Value: !GetAtt ClickstreamBucket.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-S3BucketArn
+
+  APIEndpoint:
+    Description: URL endpoint for the API Gateway
+    Value: !Sub https://${ClickstreamAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/poc
+    Export:
+      Name: !Sub ${AWS::StackName}-APIEndpoint
+
+  APIKeyId:
+    Description: ID of the API Key
+    Value: !Ref APIKey
+    Export:
+      Name: !Sub ${AWS::StackName}-APIKeyId
+
+  FirehoseDeliveryStreamName:
+    Description: Name of the Kinesis Firehose delivery stream
+    Value: !Ref ClickstreamDeliveryStream
+    Export:
+      Name: !Sub ${AWS::StackName}-FirehoseDeliveryStreamName
+
+  FirehoseDeliveryStreamArn:
+    Description: ARN of the Kinesis Firehose delivery stream
+    Value: !GetAtt ClickstreamDeliveryStream.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-FirehoseDeliveryStreamArn
+
+  LambdaFunctionName:
+    Description: Name of the Lambda transformation function
+    Value: !Ref TransformDataFunction
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaFunctionName
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda transformation function
+    Value: !GetAtt TransformDataFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaFunctionArn
+
+  AthenaWorkgroupName:
+    Description: Name of the Athena workgroup
+    Value: !Ref AthenaWorkgroup
+    Export:
+      Name: !Sub ${AWS::StackName}-AthenaWorkgroupName
+
+  GlueDatabaseName:
+    Description: Name of the Glue Database
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub ${AWS::StackName}-GlueDatabaseName
+
+  GlueCrawlerName:
+    Description: Name of the Glue Crawler
+    Value: !Ref GlueCrawler
+    Export:
+      Name: !Sub ${AWS::StackName}-GlueCrawlerName
